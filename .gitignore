@@ -1,0 +1,13 @@
+# Secrets — NEVER commit these. Wallet seeds and API keys = the agent's life.
+.env
+*.pem
+wallet_seed.json
+*_seed.json
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/

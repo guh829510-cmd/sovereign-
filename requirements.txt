@@ -1,0 +1,19 @@
+# --- Autonomous Economic Agent :: dependencies ---
+# Pinned to the AgentKit 0.2.x line (released Oct 2025). AgentKit is
+# framework- and wallet-agnostic; we drive it through LangChain.
+
+# On-chain wallet + agent actions (Coinbase Developer Platform)
+coinbase-agentkit>=0.2.0,<0.3.0
+coinbase-agentkit-langchain>=0.2.0,<0.3.0
+
+# Agent reasoning / tool-calling framework
+langchain>=0.3.0,<0.4.0
+langchain-openai>=0.2.0,<0.3.0   # LLM backend used to build the ReAct agent
+
+# Infrastructure control plane (spin up / tear down servers for self-cloning)
+python-digitalocean>=1.17.0
+
+# Supporting libs
+web3>=6.20.0        # raw RPC + on-chain price reads for the hustle loop
+python-dotenv>=1.0.0  # load secrets/config from a local .env (never commit it)
+tenacity>=8.5.0     # retry/backoff for flaky RPC + faucet calls
