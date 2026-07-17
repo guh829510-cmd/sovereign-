@@ -1,6 +1,7 @@
 # Secrets — NEVER commit these. Wallet seeds and API keys = the agent's life.
 .env
 *.pem
+wallet_data.json
 wallet_seed.json
 *_seed.json
 
