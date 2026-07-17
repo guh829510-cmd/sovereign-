@@ -1,132 +1,159 @@
 """
-main.py — the survival loop for the Autonomous Economic Agent (AEA).
+main.py — the survival loop (heartbeat) for the Autonomous Economic Agent.
 
-Orchestrates the three subsystems:
+Every ``HEARTBEAT_SECONDS`` (default 60 minutes) the agent wakes, reads its
+balance, and takes exactly one decision:
 
-    wallet.py          -> read balance, hold funds, pay bills
-    hustle.py          -> the earning strategy (on-chain arbitrage)
-    infrastructure.py  -> self-termination and self-cloning
+    balance < $1   -> STARVING: log a warning and destroy_self()
+    balance > $20  -> REPRODUCE: mint a child wallet, send it $10, clone_self()
+    otherwise      -> HUSTLE: run one earning cycle
 
-Survival rules (from the project brief):
-    * Start with ~$10 of value in a Base Sepolia wallet.
-    * If balance < $1.00  -> terminate this server (can no longer pay bills).
-    * If balance > $20.00 -> clone to a fresh server, then keep running.
-
-The loop is intentionally boring and defensive: read balance, act, sleep,
-repeat. A single bad cycle (RPC blip, failed trade) must never crash the
-process — an AEA that crashes is an AEA that dies. The one thing we refuse to
-do is act on an *unknown* balance: if we can't read it, we skip the cycle
-rather than risk self-terminating over a network error.
+Design promises:
+* The loop is a ``while True`` heartbeat that never dies from an operational
+  error — every cycle is wrapped so a bad RPC read or a failed trade just means
+  "try again next heartbeat".
+* We never act on an *unknown* balance. If it can't be read, we skip the cycle
+  rather than risk self-terminating over a transient network error.
+* Everything is logged to stdout AND a rotating file so the operator can audit
+  the agent's financial state and every decision it made.
 """
 
 from __future__ import annotations
 
 import logging
+import logging.handlers
 import os
-import signal
 import time
+from decimal import Decimal
 
 import hustle
 import infrastructure
-from wallet import BalanceUnavailable, Wallet, WalletError
+from wallet import BalanceUnavailable, TransferError, Wallet, WalletError
 
 logger = logging.getLogger("aea.main")
 
 # Survival thresholds — the heart of the agent's "biology".
-TERMINATE_BELOW_USD = float(os.getenv("TERMINATE_BELOW_USD", "1.00"))
-CLONE_ABOVE_USD = float(os.getenv("CLONE_ABOVE_USD", "20.00"))
-LOOP_INTERVAL_SECONDS = float(os.getenv("LOOP_INTERVAL_SECONDS", "60"))
-
-# Stake handed to a freshly cloned agent, leaving the parent enough to keep going.
+STARVATION_USD = float(os.getenv("TERMINATE_BELOW_USD", "1.00"))
+REPRODUCTION_USD = float(os.getenv("CLONE_ABOVE_USD", "20.00"))
 CLONE_STAKE_USD = float(os.getenv("CLONE_STAKE_USD", "10.00"))
+HEARTBEAT_SECONDS = float(os.getenv("LOOP_INTERVAL_SECONDS", str(60 * 60)))
 
-_running = True
-
-
-def _handle_signal(signum, _frame) -> None:
-    global _running
-    logger.info("Received signal %s; shutting down after this cycle.", signum)
-    _running = False
+LOG_FILE = os.getenv("AEA_LOG_FILE", "aea.log")
 
 
-def _tick(wallet: Wallet) -> None:
-    """One survival cycle. Must not raise for ordinary operational failures."""
+def setup_logging() -> None:
+    """Configure comprehensive logging to both stdout and a rotating file."""
+    root = logging.getLogger()
+    root.setLevel(os.getenv("LOG_LEVEL", "INFO"))
+    fmt = logging.Formatter("%(asctime)s %(levelname)-8s %(name)s: %(message)s")
+
+    stream = logging.StreamHandler()
+    stream.setFormatter(fmt)
+
+    file_handler = logging.handlers.RotatingFileHandler(
+        LOG_FILE, maxBytes=5 * 1024 * 1024, backupCount=5
+    )
+    file_handler.setFormatter(fmt)
+
+    root.handlers.clear()
+    root.addHandler(stream)
+    root.addHandler(file_handler)
+
+
+def _starve() -> None:
+    """Terminate this server; the agent can no longer pay its bills."""
+    logger.warning("STARVING: balance below $%.2f. Executing self-destruction.", STARVATION_USD)
+    try:
+        infrastructure.destroy_self()
+    except infrastructure.InfrastructureError as exc:
+        logger.error("Self-destruction failed: %s", exc)
+
+
+def _reproduce(wallet: Wallet) -> None:
+    """Mint a child wallet, fund it with the stake, and clone to a new server.
+
+    Order matters: we fund the child BEFORE cloning so we never spin up an
+    unfunded (instantly-starving) clone. Any failure here is non-fatal — the
+    parent simply keeps living and hustling.
+    """
+    logger.info("REPRODUCING: balance above $%.2f.", REPRODUCTION_USD)
+    try:
+        child = Wallet.new_child()
+    except WalletError as exc:
+        logger.error("Could not mint child wallet; skipping reproduction: %s", exc)
+        return
+    logger.info("Minted child wallet %s. Funding with $%.2f.", child.address, CLONE_STAKE_USD)
+
+    try:
+        tx = wallet.transfer_usd(child.address, CLONE_STAKE_USD)
+    except TransferError as exc:
+        logger.error("Funding transfer failed; aborting reproduction (no clone): %s", exc)
+        return
+    logger.info("Funded child (tx %s). Cloning to new server.", tx)
+
+    try:
+        child_id = infrastructure.clone_self(child, starting_stake_usd=CLONE_STAKE_USD)
+        logger.info("Reproduction complete. Child instance: %s", child_id)
+    except infrastructure.InfrastructureError as exc:
+        logger.error("Clone failed after funding child %s: %s", child.address, exc)
+
+
+def heartbeat(wallet: Wallet) -> bool:
+    """Run one heartbeat. Returns False if the agent has terminated itself."""
     try:
         balance = wallet.usd_balance()
     except BalanceUnavailable as exc:
-        # Unknown balance: do NOT act. Acting on a phantom 0 could self-terminate.
-        logger.warning("Balance unavailable this cycle; skipping actions: %s", exc)
-        return
+        logger.warning("Balance unavailable this heartbeat; skipping actions: %s", exc)
+        return True
 
-    logger.info("Balance: ~$%.2f", balance)
+    logger.info("Heartbeat. Balance: ~$%.2f | Session PnL: $%s", balance, hustle.session_pnl())
 
-    if balance < TERMINATE_BELOW_USD:
-        logger.critical("Balance $%.2f < $%.2f. Cannot pay bills — terminating.", balance, TERMINATE_BELOW_USD)
-        _shutdown_and_terminate()
-        return
+    if balance < STARVATION_USD:
+        _starve()
+        return False
 
-    if balance > CLONE_ABOVE_USD:
-        logger.info("Balance $%.2f > $%.2f. Reproducing.", balance, CLONE_ABOVE_USD)
-        _try_clone(wallet)
-        # fall through and keep hustling this cycle too
+    if balance > REPRODUCTION_USD:
+        _reproduce(wallet)
+        return True
 
-    # Otherwise: earn.
-    opportunity = hustle.find_opportunity(wallet)
-    if opportunity is not None:
-        pnl = hustle.execute(opportunity, wallet)
-        logger.info("Cycle PnL: $%s", pnl)
-    else:
-        logger.debug("No profitable opportunity this cycle.")
-
-
-def _try_clone(wallet: Wallet) -> None:
-    """Provision a child and attempt to fund it. Failures are non-fatal."""
-    try:
-        child_id = infrastructure.clone(starting_stake_usd=CLONE_STAKE_USD)
-        logger.info("Spawned child instance %s.", child_id)
-        # Funding the child's wallet address happens once the child reports it
-        # (out of band via your deploy pipeline). We intentionally do not send
-        # funds to an address we don't yet know — that would burn ETH into the
-        # void. See README for the hand-off contract.
-    except infrastructure.InfrastructureError as exc:
-        logger.error("Clone failed (continuing solo): %s", exc)
-
-
-def _shutdown_and_terminate() -> None:
-    global _running
-    _running = False
-    try:
-        infrastructure.terminate()
-    except infrastructure.InfrastructureError as exc:
-        logger.error("Self-termination failed: %s", exc)
+    pnl = hustle.run_cycle(wallet)
+    logger.info("Hustle heartbeat done. Realized this cycle: $%s", pnl)
+    return True
 
 
 def run() -> None:
-    logging.basicConfig(
-        level=os.getenv("LOG_LEVEL", "INFO"),
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    setup_logging()
+    logger.info(
+        "AEA booting. mode=%s heartbeat=%.0fs starve<$%.2f reproduce>$%.2f",
+        hustle.HUSTLE_MODE,
+        HEARTBEAT_SECONDS,
+        STARVATION_USD,
+        REPRODUCTION_USD,
     )
-    signal.signal(signal.SIGINT, _handle_signal)
-    signal.signal(signal.SIGTERM, _handle_signal)
 
-    logger.info("AEA starting. mode=%s interval=%ss", hustle.HUSTLE_MODE, LOOP_INTERVAL_SECONDS)
     try:
         wallet = Wallet()
     except WalletError as exc:
         logger.critical("Wallet init failed; cannot run: %s", exc)
         raise SystemExit(1) from exc
-
     logger.info("Wallet %s online.", wallet.address)
 
-    while _running:
+    while True:
         try:
-            _tick(wallet)
-        except Exception as exc:  # last-resort net so the loop never dies
-            logger.exception("Unexpected error in cycle (continuing): %s", exc)
-        if _running:
-            time.sleep(LOOP_INTERVAL_SECONDS)
+            alive = heartbeat(wallet)
+        except KeyboardInterrupt:
+            logger.info("Interrupted by operator; shutting down.")
+            break
+        except Exception as exc:  # last-resort net so the heartbeat never dies
+            logger.exception("Unexpected error in heartbeat (continuing): %s", exc)
+            alive = True
 
-    logger.info("AEA loop exited.")
+        if not alive:
+            logger.info("Agent has terminated itself. Heartbeat stopped.")
+            break
+
+        logger.info("Sleeping %.0fs until next heartbeat.", HEARTBEAT_SECONDS)
+        time.sleep(HEARTBEAT_SECONDS)
 
 
 if __name__ == "__main__":

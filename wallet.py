@@ -123,15 +123,32 @@ _network_retry = retry(
 class Wallet:
     """A Base Sepolia CDP wallet with graceful, survival-safe operations."""
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        wallet_data: str | None = None,
+        *,
+        use_persisted: bool = True,
+        persist_new: bool = True,
+    ) -> None:
+        """Load or create a CDP wallet.
+
+        Default behaviour (no args): reuse the persisted seed if present,
+        otherwise create a fresh wallet and persist it. Pass
+        ``use_persisted=False`` to force a brand-new wallet (see
+        :meth:`new_child`), and ``persist_new=False`` to avoid overwriting the
+        primary seed file with it.
+        """
         api_key_name, api_key_private_key = self._require_credentials()
-        persisted = self._load_persisted_wallet_data()
+
+        if wallet_data is None and use_persisted:
+            wallet_data = self._load_persisted_wallet_data()
+        is_new = wallet_data is None
 
         try:
             self._provider = self._build_provider(
                 api_key_name=api_key_name,
                 api_key_private_key=api_key_private_key,
-                wallet_data=persisted,
+                wallet_data=wallet_data,
             )
         except _TRANSIENT_ERRORS as exc:  # network never recovered
             raise WalletError(f"Could not reach CDP to init wallet: {exc}") from exc
@@ -148,11 +165,23 @@ class Wallet:
                 f"Refusing to run: wallet is on {network_id!r}, expected {NETWORK_ID!r}."
             )
 
-        if persisted is None:
+        if is_new and persist_new:
             self._persist_wallet_data()
             logger.info("Created new CDP wallet on %s: %s", NETWORK_ID, self.address)
+        elif is_new:
+            logger.info("Created ephemeral (unpersisted) CDP wallet: %s", self.address)
         else:
             logger.info("Loaded existing CDP wallet on %s: %s", NETWORK_ID, self.address)
+
+    @classmethod
+    def new_child(cls) -> "Wallet":
+        """Create a fresh child wallet (new seed) without touching the parent's
+        persisted seed file. Used by the reproduction flow."""
+        return cls(use_persisted=False, persist_new=False)
+
+    def export_wallet_data(self) -> str:
+        """Serialise this wallet's seed (JSON). SECRET — handle with care."""
+        return json.dumps(self._provider.export_wallet().to_dict())
 
     # -- construction helpers ------------------------------------------------
     @staticmethod
@@ -288,6 +317,14 @@ class Wallet:
     @_network_retry
     def _submit_transfer(self, to_checksum: str, amount: Decimal) -> str:
         return self._provider.native_transfer(to=to_checksum, value=amount)
+
+    def usd_to_eth(self, usd_amount: Decimal | float | str) -> Decimal:
+        """Convert a USD figure to ETH using the nominal price (testnet caveat)."""
+        return Decimal(str(usd_amount)) / ETH_USD_PRICE
+
+    def transfer_usd(self, to_address: str, usd_amount: Decimal | float | str) -> str:
+        """Send an amount specified in USD. Returns the transaction hash."""
+        return self.transfer(to_address, self.usd_to_eth(usd_amount))
 
     # -- funding -------------------------------------------------------------
     def request_faucet(self) -> str | None:

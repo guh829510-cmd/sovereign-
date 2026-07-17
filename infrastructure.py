@@ -77,16 +77,31 @@ def _current_droplet_id() -> str | None:
         return None
 
 
-def _cloud_init() -> str:
-    """user_data script that boots a fresh agent. No secrets embedded here."""
+def _cloud_init(child_wallet_data: str | None) -> str:
+    """user_data script that boots a fresh agent.
+
+    The child's *wallet seed* is delivered here (base64) so the clone controls
+    the funds the parent sends it. NOTE: user_data is readable by anything on the
+    droplet and stored by DigitalOcean — acceptable for a valueless testnet seed,
+    but on mainnet deliver the seed via a secrets manager instead, not cloud-init.
+    CDP API keys are NOT embedded; supply them out of band.
+    """
     repo = AEA_REPO_URL or "<set AEA_REPO_URL>"
+    seed_step = ""
+    if child_wallet_data:
+        import base64
+
+        b64 = base64.b64encode(child_wallet_data.encode()).decode()
+        seed_step = (
+            f"  - echo {b64} | base64 -d > /opt/aea/wallet_data.json\n"
+            "  - chmod 600 /opt/aea/wallet_data.json\n"
+        )
     return f"""#cloud-config
 runcmd:
   - apt-get update && apt-get install -y python3-venv git
   - git clone {repo} /opt/aea || true
   - cd /opt/aea && python3 -m venv .venv && . .venv/bin/activate && pip install -r requirements.txt
-  # Secrets (CDP_*, DIGITALOCEAN_TOKEN, funded wallet_data) must be delivered
-  # out-of-band by your deploy pipeline, then: python /opt/aea/main.py
+{seed_step}  # CDP_* API keys must still be delivered out of band, then: python /opt/aea/main.py
 """
 
 
@@ -94,19 +109,32 @@ def _living_instance_count(manager) -> int:
     return len(manager.get_all_droplets(tag_name=AEA_TAG))
 
 
-def clone(starting_stake_usd: float = 0.0) -> str:
-    """Provision a new agent instance; return its droplet id (or a dry-run id).
+def clone_self(child_wallet=None, starting_stake_usd: float = 0.0) -> str:
+    """Provision a new agent instance that boots ``child_wallet``'s seed.
 
-    Enforces the instance cap. Funding the clone's wallet is the caller's job
-    (via wallet.transfer to the new agent's address) — provisioning only.
+    Returns the new droplet id (or a synthetic ``dry-run-*`` id when infra is not
+    armed). Enforces the instance cap. Funding the child is the caller's job
+    (main.py transfers the stake to ``child_wallet.address`` before calling this).
+
+    ``child_wallet`` may be None to provision a seedless node (legacy behaviour).
     """
+    child_wallet_data = None
+    child_address = None
+    if child_wallet is not None:
+        try:
+            child_wallet_data = child_wallet.export_wallet_data()
+            child_address = child_wallet.address
+        except Exception as exc:
+            raise InfrastructureError(f"Could not export child wallet for clone: {exc}") from exc
+
     if not _real_infra_enabled():
         logger.warning(
-            "[DRY-RUN] Would clone a new agent droplet (region=%s size=%s, stake=$%.2f). "
-            "Set AEA_ENABLE_REAL_INFRA=1 to arm.",
+            "[DRY-RUN] Would clone a new agent droplet (region=%s size=%s, stake=$%.2f, "
+            "child=%s). Set AEA_ENABLE_REAL_INFRA=1 to arm.",
             DROPLET_REGION,
             DROPLET_SIZE,
             starting_stake_usd,
+            child_address or "n/a",
         )
         return f"dry-run-clone-{uuid.uuid4().hex[:8]}"
 
@@ -128,7 +156,7 @@ def clone(starting_stake_usd: float = 0.0) -> str:
         region=DROPLET_REGION,
         image=DROPLET_IMAGE,
         size_slug=DROPLET_SIZE,
-        user_data=_cloud_init(),
+        user_data=_cloud_init(child_wallet_data),
         tags=[AEA_TAG],
         backups=False,
     )
@@ -137,8 +165,13 @@ def clone(starting_stake_usd: float = 0.0) -> str:
     except Exception as exc:
         raise InfrastructureError(f"Droplet creation failed: {exc}") from exc
 
-    logger.info("Cloned new agent droplet %s (id=%s)", name, droplet.id)
+    logger.info("Cloned new agent droplet %s (id=%s) for child %s", name, droplet.id, child_address)
     return str(droplet.id)
+
+
+# Backwards-compatible alias for the old provisioning-only signature.
+def clone(starting_stake_usd: float = 0.0) -> str:
+    return clone_self(child_wallet=None, starting_stake_usd=starting_stake_usd)
 
 
 def terminate() -> None:
@@ -169,3 +202,8 @@ def terminate() -> None:
         raise InfrastructureError(f"Failed to destroy droplet {droplet_id}: {exc}") from exc
 
     logger.info("Terminated droplet %s. Goodbye.", droplet_id)
+
+
+def destroy_self() -> None:
+    """Alias for :func:`terminate` — the name used by the survival loop."""
+    terminate()
