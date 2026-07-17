@@ -233,3 +233,76 @@ def terminate() -> None:
 def destroy_self() -> None:
     """Alias for :func:`terminate` — the name used by the survival loop."""
     terminate()
+
+
+def destroy_instance(droplet_id: str) -> None:
+    """Destroy an ARBITRARY droplet by id. Used by the watchdog to cull a
+    misbehaving instance (not self-termination)."""
+    if not _real_infra_enabled():
+        logger.warning("[DRY-RUN] Would destroy droplet %s. Set AEA_ENABLE_REAL_INFRA=1 to arm.", droplet_id)
+        return
+    import digitalocean
+
+    token = _require_token()
+    try:
+        droplet = digitalocean.Droplet(token=token, id=droplet_id)
+        droplet.load()
+        droplet.destroy()
+    except Exception as exc:
+        raise InfrastructureError(f"Failed to destroy droplet {droplet_id}: {exc}") from exc
+    logger.info("Destroyed droplet %s (watchdog cull).", droplet_id)
+
+
+# ---------------------------------------------------------------------------
+# External-world observations consumed ONLY by the regulator (regulator.py).
+#
+# These are MEASURED reality: the live droplet count from the DigitalOcean API
+# and on-chain financial figures from the wallet/oracle. The regulator reads
+# ONLY these (plus its own frozen constants) to decide — it never reads
+# agent-tracked state. In production the agent cannot forge them: it controls
+# neither DigitalOcean's droplet list nor the chain. In dry-run/testnet they
+# come from an injectable snapshot so the TEST HARNESS can play "the world".
+# Agent/strategy code must NEVER write here; that is the boundary the whole
+# design rests on (and the out-of-process watchdog is the backstop if it tries).
+# ---------------------------------------------------------------------------
+_OBSERVED_WORLD = {
+    "live_instances": 0,
+    "total_capital_usd": 0.0,
+    "realized_earnings_usd": 0.0,
+    "period_spend_usd": 0.0,
+}
+
+
+def set_observed_world(**values) -> None:
+    """TEST/WORLD-ONLY: inject measured reality for dry-run runs. Represents the
+    DO API + on-chain oracle. No effect when armed (real reads hit the APIs)."""
+    for key, val in values.items():
+        if key not in _OBSERVED_WORLD:
+            raise KeyError(f"unknown world observation: {key!r}")
+        _OBSERVED_WORLD[key] = val
+
+
+def live_instance_count() -> int:
+    """Live agent droplets, from the DigitalOcean API — never agent-tracked state."""
+    if not _real_infra_enabled():
+        return int(_OBSERVED_WORLD["live_instances"])
+    import digitalocean
+
+    token = _require_token()
+    manager = digitalocean.Manager(token=token)
+    return _living_instance_count(manager)
+
+
+def observed_total_capital_usd() -> float:
+    """Total capital the agent currently controls (on-chain in production)."""
+    return float(_OBSERVED_WORLD["total_capital_usd"])
+
+
+def observed_realized_earnings_usd() -> float:
+    """Realized earnings measured on-chain/by oracle (not agent-reported PnL)."""
+    return float(_OBSERVED_WORLD["realized_earnings_usd"])
+
+
+def observed_period_spend_usd() -> float:
+    """Spend in the current period, from the settlement ledger (not agent state)."""
+    return float(_OBSERVED_WORLD["period_spend_usd"])
