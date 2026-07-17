@@ -252,6 +252,21 @@ class Wallet:
                 f"Failed to persist wallet seed to {WALLET_DATA_FILE}: {exc}"
             ) from exc
 
+    def persist_seed_to(self, path: str | Path) -> Path:
+        """Persist THIS wallet's seed to ``path`` with 0600 perms, same mechanism
+        as the primary seed. Used to make a *child* wallet recoverable BEFORE it
+        is ever funded, so a later failure can't strand its money. Returns the
+        Path written. Filenames ending in ``_seed.json`` are already git-ignored.
+        """
+        p = Path(path)
+        try:
+            fd = os.open(p, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, stat.S_IRUSR | stat.S_IWUSR)
+            with os.fdopen(fd, "w") as fh:
+                fh.write(self.export_wallet_data())
+        except OSError as exc:
+            raise WalletConfigError(f"Failed to persist wallet seed to {p}: {exc}") from exc
+        return p
+
     # -- balance -------------------------------------------------------------
     def get_balance_wei(self) -> Decimal:
         """Native balance in wei. Raises BalanceUnavailable on read failure."""

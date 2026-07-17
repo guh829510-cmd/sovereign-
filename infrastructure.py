@@ -55,6 +55,32 @@ def _real_infra_enabled() -> bool:
     return os.getenv("AEA_ENABLE_REAL_INFRA", "").lower() in {"1", "true", "yes"}
 
 
+def armed() -> bool:
+    """Public predicate: are real, money/server-moving actions enabled?
+
+    The survival loop uses this to gate the child-funding transfer with the same
+    flag that gates real provisioning, so no real funds move while infra is dry.
+    """
+    return _real_infra_enabled()
+
+
+def can_clone() -> bool:
+    """True if we are below the instance cap and may provision another agent.
+
+    Callable *before* any funds move, so reproduction can bail without stranding
+    a stake. In dry-run there are no real droplets to count (and no token), so
+    this returns True; the authoritative live count only runs when armed —
+    ``clone_self`` re-checks the cap as defense in depth.
+    """
+    if not _real_infra_enabled():
+        return True
+    import digitalocean
+
+    token = _require_token()
+    manager = digitalocean.Manager(token=token)
+    return _living_instance_count(manager) < MAX_LIVING_INSTANCES
+
+
 def _require_token() -> str:
     token = os.getenv("DIGITALOCEAN_TOKEN") or os.getenv("DIGITALOCEAN_ACCESS_TOKEN")
     if not token:
