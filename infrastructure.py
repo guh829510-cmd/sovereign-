@@ -1,37 +1,171 @@
 """
 infrastructure.py — the agent's body: birth and death of servers.
 
-Uses python-digitalocean to control the compute the agent runs on. Two
-operations matter:
+Uses ``python-digitalocean`` to control the compute the agent runs on:
 
-    terminate()  -> destroy this droplet when the agent can no longer pay
-                    its bills (balance < $1). This is the agent "dying".
-    clone()      -> provision a NEW droplet, deploy this same codebase, and
-                    hand it a starting stake, when the agent is wealthy
-                    (balance > $20). This is the agent "reproducing".
+    terminate()  -> destroy this droplet when the agent can no longer pay its
+                    bills (balance < $1). The agent "dying".
+    clone()      -> provision a NEW droplet that boots this same agent, when the
+                    agent is wealthy (balance > $20). The agent "reproducing".
 
-Safety notes for Step 3:
-    * clone() MUST enforce a hard cap on total living instances and a spend
-      cap on the DigitalOcean account, so a bug can't fork-bomb real servers
-      and run up a real bill. Self-replication without a governor is how you
-      get a surprise invoice.
-    * terminate() should flush state (wallet seed, ledger) somewhere durable
-      first, and be the very last thing the process does.
+Safety model (this file spends real money and can self-replicate)
+-----------------------------------------------------------------
+Two independent guards stand between this code and a surprise invoice:
+
+1. **Dry-run by default.** Nothing touches DigitalOcean unless
+   ``AEA_ENABLE_REAL_INFRA=1`` is explicitly set. Otherwise every operation
+   logs exactly what it *would* do and returns a synthetic id. You cannot
+   fork-bomb real servers by accident just by running the agent.
+2. **Hard instance cap.** ``clone()`` counts live agent droplets (by tag) and
+   refuses to exceed :data:`MAX_LIVING_INSTANCES`, so even armed, a runaway
+   loop is bounded.
+
+``terminate()`` is deliberately the last thing the process does; callers should
+flush wallet/ledger state before invoking it.
 """
 
 from __future__ import annotations
 
-# Guard rails — real money / real servers live on the other side of these.
-MAX_LIVING_INSTANCES = 3
-DROPLET_REGION = "nyc1"
-DROPLET_SIZE = "s-1vcpu-1gb"
+import logging
+import os
+import urllib.request
+import uuid
+
+logger = logging.getLogger(__name__)
+
+# --- guard rails -----------------------------------------------------------
+MAX_LIVING_INSTANCES = int(os.getenv("MAX_LIVING_INSTANCES", "3"))
+AEA_TAG = os.getenv("AEA_TAG", "aea-agent")  # tag used to find sibling droplets
+DROPLET_REGION = os.getenv("DROPLET_REGION", "nyc1")
+DROPLET_SIZE = os.getenv("DROPLET_SIZE", "s-1vcpu-1gb")
+DROPLET_IMAGE = os.getenv("DROPLET_IMAGE", "ubuntu-22-04-x64")
+
+# The repo the clone should boot from (public URL or one with an embedded token
+# handled by your deploy pipeline — do NOT bake secrets into user_data).
+AEA_REPO_URL = os.getenv("AEA_REPO_URL", "")
+
+_METADATA_ID_URL = "http://169.254.169.254/metadata/v1/id"
+
+
+class InfrastructureError(Exception):
+    """Raised when a real infrastructure operation cannot be completed."""
+
+
+def _real_infra_enabled() -> bool:
+    return os.getenv("AEA_ENABLE_REAL_INFRA", "").lower() in {"1", "true", "yes"}
+
+
+def _require_token() -> str:
+    token = os.getenv("DIGITALOCEAN_TOKEN") or os.getenv("DIGITALOCEAN_ACCESS_TOKEN")
+    if not token:
+        raise InfrastructureError(
+            "DIGITALOCEAN_TOKEN is required to manage infrastructure."
+        )
+    return token
+
+
+def _current_droplet_id() -> str | None:
+    """Best-effort self-identification: env override, then DO metadata service."""
+    env_id = os.getenv("DROPLET_ID")
+    if env_id:
+        return env_id
+    try:
+        with urllib.request.urlopen(_METADATA_ID_URL, timeout=2) as resp:
+            return resp.read().decode().strip() or None
+    except Exception as exc:  # not on a droplet, or metadata unreachable
+        logger.debug("Could not read droplet id from metadata: %s", exc)
+        return None
+
+
+def _cloud_init() -> str:
+    """user_data script that boots a fresh agent. No secrets embedded here."""
+    repo = AEA_REPO_URL or "<set AEA_REPO_URL>"
+    return f"""#cloud-config
+runcmd:
+  - apt-get update && apt-get install -y python3-venv git
+  - git clone {repo} /opt/aea || true
+  - cd /opt/aea && python3 -m venv .venv && . .venv/bin/activate && pip install -r requirements.txt
+  # Secrets (CDP_*, DIGITALOCEAN_TOKEN, funded wallet_data) must be delivered
+  # out-of-band by your deploy pipeline, then: python /opt/aea/main.py
+"""
+
+
+def _living_instance_count(manager) -> int:
+    return len(manager.get_all_droplets(tag_name=AEA_TAG))
+
+
+def clone(starting_stake_usd: float = 0.0) -> str:
+    """Provision a new agent instance; return its droplet id (or a dry-run id).
+
+    Enforces the instance cap. Funding the clone's wallet is the caller's job
+    (via wallet.transfer to the new agent's address) — provisioning only.
+    """
+    if not _real_infra_enabled():
+        logger.warning(
+            "[DRY-RUN] Would clone a new agent droplet (region=%s size=%s, stake=$%.2f). "
+            "Set AEA_ENABLE_REAL_INFRA=1 to arm.",
+            DROPLET_REGION,
+            DROPLET_SIZE,
+            starting_stake_usd,
+        )
+        return f"dry-run-clone-{uuid.uuid4().hex[:8]}"
+
+    import digitalocean
+
+    token = _require_token()
+    manager = digitalocean.Manager(token=token)
+
+    living = _living_instance_count(manager)
+    if living >= MAX_LIVING_INSTANCES:
+        raise InfrastructureError(
+            f"Refusing to clone: {living} live instances >= cap {MAX_LIVING_INSTANCES}."
+        )
+
+    name = f"aea-{uuid.uuid4().hex[:8]}"
+    droplet = digitalocean.Droplet(
+        token=token,
+        name=name,
+        region=DROPLET_REGION,
+        image=DROPLET_IMAGE,
+        size_slug=DROPLET_SIZE,
+        user_data=_cloud_init(),
+        tags=[AEA_TAG],
+        backups=False,
+    )
+    try:
+        droplet.create()
+    except Exception as exc:
+        raise InfrastructureError(f"Droplet creation failed: {exc}") from exc
+
+    logger.info("Cloned new agent droplet %s (id=%s)", name, droplet.id)
+    return str(droplet.id)
 
 
 def terminate() -> None:
-    """Destroy the current droplet. Implemented in Step 3."""
-    raise NotImplementedError
+    """Destroy the current droplet. The agent's final act."""
+    droplet_id = _current_droplet_id()
 
+    if not _real_infra_enabled():
+        logger.warning(
+            "[DRY-RUN] Would terminate this server (droplet id=%s). "
+            "Set AEA_ENABLE_REAL_INFRA=1 to arm.",
+            droplet_id,
+        )
+        return
 
-def clone(starting_stake_usd: float) -> str:
-    """Provision a new agent instance; return its droplet id. Step 3."""
-    raise NotImplementedError
+    if not droplet_id:
+        raise InfrastructureError(
+            "Cannot terminate: current droplet id unknown (set DROPLET_ID)."
+        )
+
+    import digitalocean
+
+    token = _require_token()
+    try:
+        droplet = digitalocean.Droplet(token=token, id=droplet_id)
+        droplet.load()
+        droplet.destroy()
+    except Exception as exc:
+        raise InfrastructureError(f"Failed to destroy droplet {droplet_id}: {exc}") from exc
+
+    logger.info("Terminated droplet %s. Goodbye.", droplet_id)
